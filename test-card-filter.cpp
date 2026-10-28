@@ -14,10 +14,15 @@
 #include <obs-module.h>
 #include <obs-frontend-api.h>
 #include <graphics/graphics.h>
-#include <graphics/image-file.h>
 #include <graphics/vec2.h>
 #include <graphics/vec4.h>
 #include <util/platform.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
 
 #include <streamup/ui/feedback.hpp>
 
@@ -93,7 +98,8 @@ struct test_card_filter {
 	float text_off_y = 0.0f;
 
 	// user background image
-	gs_image_file_t bg_img = {};
+	void *bg_img_storage = nullptr;
+	gs_texture_t *bg_img_tex = nullptr;
 	bool bg_img_loaded = false;
 	char *bg_img_path = nullptr;
 
@@ -154,6 +160,112 @@ static const char *tc_get_name(void *)
 	return "StreamUP Test Card";
 }
 
+// Runtime resolver for OBS image helper functions.
+// OBS 33 removed gs_image_file_* and replaced it with gs_image_file_ex_*.
+// Dynamically resolving symbols allows the plugin to run on both OBS 31-32 and OBS 33+.
+typedef void (*tc_img_ex_init_t)(void *img, const char *file, int alpha_mode);
+typedef void (*tc_img_ex_free_t)(void *img);
+typedef void (*tc_img_ex_init_tex_t)(void *img);
+
+typedef void (*tc_img_leg_init_t)(void *img, const char *file);
+typedef void (*tc_img_leg_free_t)(void *img);
+typedef void (*tc_img_leg_init_tex_t)(void *img);
+
+struct tc_img_api {
+	tc_img_ex_init_t ex_init = nullptr;
+	tc_img_ex_free_t ex_free = nullptr;
+	tc_img_ex_init_tex_t ex_init_tex = nullptr;
+
+	tc_img_leg_init_t leg_init = nullptr;
+	tc_img_leg_free_t leg_free = nullptr;
+	tc_img_leg_init_tex_t leg_init_tex = nullptr;
+
+	bool is_ex = false;
+	bool ready = false;
+
+	void resolve()
+	{
+		if (ready)
+			return;
+		ready = true;
+#ifdef _WIN32
+		HMODULE h = GetModuleHandleW(L"obs.dll");
+		if (!h)
+			return;
+		ex_init = (tc_img_ex_init_t)GetProcAddress(h, "gs_image_file_ex_init");
+		ex_free = (tc_img_ex_free_t)GetProcAddress(h, "gs_image_file_ex_free");
+		ex_init_tex = (tc_img_ex_init_tex_t)GetProcAddress(h, "gs_image_file_ex_init_texture");
+		if (ex_init && ex_free && ex_init_tex) {
+			is_ex = true;
+		} else {
+			leg_init = (tc_img_leg_init_t)GetProcAddress(h, "gs_image_file_init");
+			leg_free = (tc_img_leg_free_t)GetProcAddress(h, "gs_image_file_free");
+			leg_init_tex = (tc_img_leg_init_tex_t)GetProcAddress(h, "gs_image_file_init_texture");
+		}
+#else
+		void *h = dlopen(NULL, RTLD_LAZY);
+		if (!h)
+			return;
+		ex_init = (tc_img_ex_init_t)dlsym(h, "gs_image_file_ex_init");
+		ex_free = (tc_img_ex_free_t)dlsym(h, "gs_image_file_ex_free");
+		ex_init_tex = (tc_img_ex_init_tex_t)dlsym(h, "gs_image_file_ex_init_texture");
+		if (ex_init && ex_free && ex_init_tex) {
+			is_ex = true;
+		} else {
+			leg_init = (tc_img_leg_init_t)dlsym(h, "gs_image_file_init");
+			leg_free = (tc_img_leg_free_t)dlsym(h, "gs_image_file_free");
+			leg_init_tex = (tc_img_leg_init_tex_t)dlsym(h, "gs_image_file_init_texture");
+		}
+		dlclose(h);
+#endif
+	}
+};
+
+static tc_img_api s_img_api;
+
+static void tc_image_free(struct test_card_filter *f)
+{
+	if (!f->bg_img_storage)
+		return;
+
+	s_img_api.resolve();
+	if (s_img_api.is_ex && s_img_api.ex_free)
+		s_img_api.ex_free(f->bg_img_storage);
+	else if (s_img_api.leg_free)
+		s_img_api.leg_free(f->bg_img_storage);
+
+	bfree(f->bg_img_storage);
+	f->bg_img_storage = nullptr;
+	f->bg_img_tex = nullptr;
+}
+
+static bool tc_image_load(struct test_card_filter *f, const char *path)
+{
+	s_img_api.resolve();
+	f->bg_img_storage = bzalloc(512);
+	if (!f->bg_img_storage)
+		return false;
+
+	if (s_img_api.is_ex && s_img_api.ex_init && s_img_api.ex_init_tex) {
+		s_img_api.ex_init(f->bg_img_storage, path, 0); // GS_IMAGE_ALPHA_STRAIGHT
+		s_img_api.ex_init_tex(f->bg_img_storage);
+	} else if (s_img_api.leg_init && s_img_api.leg_init_tex) {
+		s_img_api.leg_init(f->bg_img_storage, path);
+		s_img_api.leg_init_tex(f->bg_img_storage);
+	} else {
+		bfree(f->bg_img_storage);
+		f->bg_img_storage = nullptr;
+		return false;
+	}
+
+	f->bg_img_tex = *(gs_texture_t **)f->bg_img_storage;
+	if (!f->bg_img_tex) {
+		tc_image_free(f);
+		return false;
+	}
+	return true;
+}
+
 static void tc_reload_image(struct test_card_filter *f, const char *path)
 {
 	const char *cur = f->bg_img_path ? f->bg_img_path : "";
@@ -162,13 +274,12 @@ static void tc_reload_image(struct test_card_filter *f, const char *path)
 
 	obs_enter_graphics();
 	if (f->bg_img_loaded) {
-		gs_image_file_free(&f->bg_img);
+		tc_image_free(f);
 		f->bg_img_loaded = false;
 	}
 	if (path && *path) {
-		gs_image_file_init(&f->bg_img, path);
-		gs_image_file_init_texture(&f->bg_img);
-		f->bg_img_loaded = (f->bg_img.texture != nullptr);
+		if (tc_image_load(f, path))
+			f->bg_img_loaded = true;
 	}
 	obs_leave_graphics();
 
@@ -295,7 +406,7 @@ static void tc_destroy(void *data)
 	if (f->blank_tex)
 		gs_texture_destroy(f->blank_tex);
 	if (f->bg_img_loaded)
-		gs_image_file_free(&f->bg_img);
+		tc_image_free(f);
 	obs_leave_graphics();
 
 	bfree(f->bg_img_path);
@@ -371,7 +482,7 @@ static void tc_set_effect_params(struct test_card_filter *f, uint32_t w, uint32_
 	gs_effect_set_float(f->p_border_width, f->border_width);
 
 	gs_effect_set_texture(f->p_overlay, f->overlay_tex ? f->overlay_tex : f->blank_tex);
-	gs_effect_set_texture(f->p_bg_image, f->bg_img_loaded ? f->bg_img.texture : f->blank_tex);
+	gs_effect_set_texture(f->p_bg_image, f->bg_img_loaded && f->bg_img_tex ? f->bg_img_tex : f->blank_tex);
 }
 
 static void tc_render(void *data, gs_effect_t *)

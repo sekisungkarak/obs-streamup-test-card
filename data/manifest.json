@@ -1,0 +1,11 @@
+{
+    "display_name": "StreamUP Test Card",
+    "id": "com.andilippi.streamup-test-card",
+    "version": "0.0.1",
+    "authors": ["StreamUP"],
+    "name": "streamup-test-card",
+    "description": "Video filter test card with custom text for OBS Studio",
+    "urls": {
+        "website": "https://streamup.tips"
+    }
+}
